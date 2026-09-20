@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /srv
+
+RUN pip install --no-cache-dir \
+    httpx==0.28.1 \
+    pytest==8.3.4 \
+    cryptography==44.0.0
+
+COPY tests ./tests
+
+# 默认对 compose 网络内的 API 实例做黑盒验收
+CMD ["pytest", "-q", "tests"]

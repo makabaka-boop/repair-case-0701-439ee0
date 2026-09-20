@@ -1,0 +1,50 @@
+name: coldchain
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: coldchain
+      POSTGRES_PASSWORD: coldchain
+      POSTGRES_DB: coldchain
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldchain -d coldchain"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
+      PLATFORM_ADMIN_TOKEN: ${PLATFORM_ADMIN_TOKEN:-platform-admin-token}
+      PORT: "8080"
+    ports:
+      # 宿主端口由 API_PORT 覆盖（默认 8080）
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 一次性验收服务：API 健康后对其跑 pytest，退出码即验收结果，随后退出不重启。
+  # 随 `docker compose up --build` 自动执行；`docker compose logs verify` 看结果，
+  # 或 `docker compose run --build verify` 手动再跑一次。
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    environment:
+      API_BASE_URL: http://api:8080
+      PLATFORM_ADMIN_TOKEN: ${PLATFORM_ADMIN_TOKEN:-platform-admin-token}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
+    command: ["pytest", "-q", "tests"]
+
+volumes:
+  pgdata:
