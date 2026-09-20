@@ -463,53 +463,41 @@ def create_app() -> FastAPI:
 
         pool = request.app.state.pool
         async with pool.acquire() as conn:
-            # keyId 全局唯一，先统一解析密钥；租户归属由已认证的路径负责。
-            key = await conn.fetchrow(
-                "SELECT id, role, public_key FROM keys "
-                "WHERE id = $1",
-                x_key_id,
-            )
-            if key is None:
-                raise ApiError(404, "KEY_UNKNOWN", "未知 keyId")
-            if key["role"] == "retired":
-                raise ApiError(409, "KEY_RETIRED", "该密钥已退休")
-
-            if len(signature) != SIG_LENGTH:
-                raise ApiError(400, "MALFORMED_SIGNATURE", "Ed25519 签名必须为 64 字节")
-
-            # 先预留回执，使审计记录保留解析时的角色；最终角色裁决失败时清理。
-            receipt_id = await conn.fetchval(
-                "INSERT INTO receipts "
-                "(tenant_id, key_id, role_at_accept, body_sha256, body_length) "
-                "VALUES ($1, $2, $3, $4, $5) RETURNING id",
-                tenant_id, x_key_id, key["role"],
-                hashlib.sha256(body).digest(), len(body),
-            )
-
-            verify_ed25519(key["public_key"], signature, body)
-
-            # 返回前刷新角色，只允许当前钥完成接收，避免轮换中的旧状态被沿用。
-            authoritative_role = await conn.fetchval(
-                "SELECT role FROM keys WHERE id = $1",
-                x_key_id,
-            )
-            if authoritative_role != "current":
-                await conn.execute(
-                    "DELETE FROM receipts WHERE id = $1",
-                    receipt_id,
+            # 线性化点与回执写入在同一事务：本次快照的角色即排序点，
+            # 验签通过才落回执；任一裁决失败整体回滚，不留审计脏数据。
+            async with conn.transaction():
+                # keyId 必须属于路径租户；不存在与跨租户统一 KEY_UNKNOWN。
+                key = await conn.fetchrow(
+                    "SELECT id, role, public_key FROM keys "
+                    "WHERE id = $1 AND tenant_id = $2",
+                    x_key_id, tenant_id,
                 )
-                if authoritative_role == "retired":
+                if key is None:
+                    raise ApiError(404, "KEY_UNKNOWN", "未知 keyId")
+                # 快照为 retired：晚于退休点的报文立即被拒
+                if key["role"] == "retired":
                     raise ApiError(409, "KEY_RETIRED", "该密钥已退休")
-                raise ApiError(
-                    404,
-                    "KEY_UNKNOWN",
-                    "该 keyId 当前不可用于接收报文",
+
+                if len(signature) != SIG_LENGTH:
+                    raise ApiError(400, "MALFORMED_SIGNATURE", "Ed25519 签名必须为 64 字节")
+
+                # 验签失败抛错，事务回滚，不产生回执
+                verify_ed25519(key["public_key"], signature, body)
+
+                # 快照为 current / candidate / retiring：验签通过即出回执。
+                # 即使验签期间并发退休，本请求已在退休点之前排序，照常接收。
+                receipt_id = await conn.fetchval(
+                    "INSERT INTO receipts "
+                    "(tenant_id, key_id, role_at_accept, body_sha256, body_length) "
+                    "VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                    tenant_id, x_key_id, key["role"],
+                    hashlib.sha256(body).digest(), len(body),
                 )
 
-            return {
-                "receiptId": str(receipt_id),
-                "role": authoritative_role,
-            }
+                return {
+                    "receiptId": str(receipt_id),
+                    "role": key["role"],
+                }
 
     @app.get("/admin/tenants/{tenant_id}/receipts")
     async def list_receipts(
